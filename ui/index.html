@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>HTTP Proxy Inspector</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🔭</text></svg>">
+  <link rel="stylesheet" href="/styles.css">
+  <script src="/theme.js"></script>
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <header class="header">
+    <h1>🔭 HTTP Proxy Inspector <span id="version" class="version"></span></h1>
+    <div class="header-controls">
+      <span id="connection" class="connection-status" data-state="connecting">
+        <span class="dot"></span><span class="label">connecting…</span>
+      </span>
+      <button id="theme-toggle" class="theme-toggle" type="button"></button>
+      <button id="clear" class="clear-btn" type="button">🗑️ Clear</button>
+    </div>
+  </header>
+
+  <nav id="proxies" class="proxy-bar" aria-label="Proxies"></nav>
+
+  <div class="toolbar">
+    <div id="method-filters" class="filters"></div>
+    <input id="search" class="search" type="search" placeholder="Filter by URL…" autocomplete="off" spellcheck="false">
+    <div id="stats" class="stats"></div>
+  </div>
+
+  <section id="timeline" class="timeline-container" aria-label="Timeline"></section>
+
+  <section class="network-table" aria-label="Requests">
+    <div class="network-header">
+      <div>Path</div>
+      <div>Proxy</div>
+      <div>Method</div>
+      <div>Status</div>
+      <div class="align-right">Duration</div>
+      <div class="align-right">Time</div>
+    </div>
+    <div id="network-list"></div>
+    <div id="empty" class="no-data">Waiting for requests…</div>
+  </section>
+</body>
+</html>

@@ -1,20 +1,17 @@
 {
-    "compilerOptions": {
-      "target": "ES2021",
-      "module": "CommonJS",
-      "declaration": true,
-      "outDir": "dist",
-      "strict": true,
-      "esModuleInterop": true,
-      "forceConsistentCasingInFileNames": true,
-      "skipLibCheck": true,
-      "jsx": "react-jsx",
-      "allowSyntheticDefaultImports": true,
-      "moduleResolution": "node",
-      "lib": ["ES2021", "DOM"],
-      "types": ["node"]
-    },
-    "include": ["src"],
-    "exclude": ["node_modules", "dist"]
-  }
-  
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "Node16",
+    "moduleResolution": "Node16",
+    "lib": ["ES2022"],
+    "types": ["node"],
+    "outDir": "dist",
+    "rootDir": "src",
+    "declaration": true,
+    "strict": true,
+    "esModuleInterop": true,
+    "forceConsistentCasingInFileNames": true,
+    "skipLibCheck": true
+  },
+  "include": ["src"]
+}

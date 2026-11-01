@@ -1,213 +1,218 @@
-# Next Http Inspector
+# HTTP Proxy Inspector
 
-**Fetch interceptor for Next.js** that connects directly to external WebSocket servers (dev-only).
+[![npm](https://img.shields.io/npm/v/http-proxy-inspector)](https://www.npmjs.com/package/http-proxy-inspector)
+[![CI](https://github.com/JhonSteven/http-proxy-inspector/actions/workflows/ci.yml/badge.svg)](https://github.com/JhonSteven/http-proxy-inspector/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-This package provides a fetch interceptor that captures HTTP requests and responses, connecting directly to external WebSocket servers for real-time monitoring.
+**Local proxies that forward to your real APIs and capture every request and response in a web UI.** It works with any HTTP client: Next.js server components and route handlers, the browser, mobile apps or scripts.
 
-## 🎯 Focus
+```
+ your app ──► http://localhost:3001 ──► https://api.users.com
+          ──► http://localhost:3002 ──► https://api.payments.com
+                       │
+                       ▼
+              http://localhost:4000   (web UI: live list, timeline, headers, bodies)
+```
 
-This package **connects directly** to external WebSocket servers using only the `ws` library. It does not require any external packages and creates its own WebSocket client connections.
+- 🔀 **Many proxies, one process**: one local port per API, all shown in the same UI.
+- 🔍 **Full capture**: method, URL, headers, query, request and response bodies (gzip/brotli/deflate decoded, plus zstd on Node 22.15+), status and timings.
+- 🌊 **Streaming-safe**: responses are piped as they arrive, so SSE and large downloads are not buffered.
+- 🧭 **Transparent**: rewrites `Host`, redirects and cookie domains so clients stay on the proxy; answers CORS preflights for localhost origins.
+- 🔒 **Local only**: binds to localhost and rejects foreign `Host` headers. No runtime dependencies.
 
-## ✨ Features
+> ⚠️ Development tool. Do not expose it publicly or use it in production.
 
-- 🔍 **Fetch Interceptor**: Captures all HTTP requests and responses
-- 📡 **Direct WebSocket Connection**: Connects directly to external servers
-- 🛡️ **Development Only**: Automatically disabled in production
-- 🚀 **Zero External Dependencies**: Only requires `ws` library
-- 🔒 **Single Initialization**: Prevents multiple initializations automatically
-
-## 🚀 Installation
-
-> ⚠️ **Development Only**: This package is designed exclusively for development environments. Do not install in production.
+## Installation
 
 ```bash
-npm install --save-dev next-http-inspector
+npm install --save-dev http-proxy-inspector
 ```
 
-## 📖 Usage
+Requires Node.js 22 or newer.
 
-### For Next.js
+## Quick start
 
-1. **Initialize in your root layout** (server-side only):
+1. Create a config file in your project root:
 
-```typescript
-// app/layout.tsx (or pages/_app.tsx for Pages Router)
-import { initFetchServerInterceptor } from 'next-http-inspector';
+   ```bash
+   npx http-proxy-inspector init
+   ```
 
-export default function RootLayout({ children }: { children: React.ReactNode }) {
-  // Initialize only on server side
-  if (typeof window === 'undefined') {
-    initFetchServerInterceptor({
-      websocket: { enabled: true, port: 8080 },
-      http: { enabled: true, host: 'localhost', port: 3001, endpoint: '/api/logs' }
-    });
-  }
+2. Point each proxy at a real API (`http-proxy-inspector.config.json`):
 
-  return (
-    <html>
-      <body>{children}</body>
-    </html>
-  );
-}
-```
+   ```json
+   {
+     "ui": { "port": 4000 },
+     "proxies": [
+       { "name": "users", "port": 3001, "target": "https://api.users.com" },
+       { "name": "payments", "port": 3002, "target": "https://api.payments.com/v1" }
+     ]
+   }
+   ```
 
-2. **Start external servers** (in a separate terminal):
+3. Make your app call the proxy instead of the real API, for example in `.env.development`:
 
-```bash
-# Install the server globally (one-time setup)
-npm install -g next-http-inspector-server
+   ```bash
+   USERS_API_URL=http://localhost:3001
+   PAYMENTS_API_URL=http://localhost:3002
+   ```
 
-# Start the server
-next-inspector-server --ui-port 3001 --ws-port 8080
-```
+   A request to `http://localhost:3002/charges?limit=5` is forwarded to `https://api.payments.com/v1/charges?limit=5`.
 
-3. **Start your Next.js app**:
+4. Start the inspector and your dev server together:
 
-```bash
-npm run dev
-```
+   ```json
+   {
+     "scripts": {
+       "dev": "next dev",
+       "dev:inspect": "http-proxy-inspector -- next dev"
+     }
+   }
+   ```
 
-4. **Access the monitoring UI**:
+   Everything after `--` runs as a child process; the proxies stop when it exits.
 
-Open [http://localhost:3001/ui](http://localhost:3001/ui) in your browser.
+5. Open [http://localhost:4000](http://localhost:4000).
 
-### Configuration Options
+Keep the real URLs in `.env.production` (or your deployment settings) so production never goes through the proxy.
 
-```typescript
-initFetchServerInterceptor({
-  websocket: {
-    enabled: true,          // Enable WebSocket connection
-    port: 8080             // WebSocket port
-  },
-  http: {
-    enabled: true,         // Enable HTTP fallback
-    host: 'localhost',     // HTTP server host
-    port: 3001,            // HTTP server port
-    endpoint: '/api/logs'  // HTTP endpoint
-  },
-  fetch: global.fetch  // Optional: custom fetch function
+## Configuration
+
+The CLI looks for `http-proxy-inspector.config.json`, `.js`, `.mjs` or `.cjs` in the current folder (or use `--config <file>`). JavaScript configs can read environment variables and get autocompletion through `defineConfig`:
+
+```js
+// http-proxy-inspector.config.mjs
+import { defineConfig } from 'http-proxy-inspector';
+
+export default defineConfig({
+  proxies: [
+    { name: 'users', port: 3001, target: process.env.USERS_API_TARGET ?? 'https://api.users.com' },
+  ],
 });
 ```
 
-## 🏗️ Architecture
+| Option | Default | Description |
+| --- | --- | --- |
+| `proxies[].port` | required | Local port for this proxy. |
+| `proxies[].target` | required | Real URL to forward to. May include a base path; no query string. |
+| `proxies[].name` | target host | Label shown in the UI and terminal. |
+| `proxies[].changeOrigin` | `true` | Send the target's host in the `Host` header and strip `Domain` from `Set-Cookie`. |
+| `proxies[].secure` | `true` | Verify TLS certificates. Set `false` for self-signed targets. |
+| `proxies[].cors` | `true` | `true`: answer preflights and allow localhost origins. `string[]`: allow those origins. `false`: pass CORS through untouched. |
+| `proxies[].timeout` | none | Fail the request after this many ms without upstream activity. |
+| `ui.port` | `4000` | Port for the web UI. |
+| `ui.enabled` | `true` | Set `false` to run only the proxies. |
+| `host` | `localhost` | Interface to bind. `localhost` listens on both 127.0.0.1 and ::1. |
+| `maxEntries` | `500` | Requests kept in memory; older ones are dropped. |
+| `maxBodySize` | `1048576` | Bytes captured per body. Bodies are always forwarded whole. |
+
+## CLI
 
 ```
-┌─────────────────────────────────────┐
-│           Next.js App               │
-│  ┌─────────────────────────────────┐│
-│  │     Interceptors Package        ││
-│  │  ┌─────────────────────────────┐││
-│  │  │  Fetch Interceptor          │││
-│  │  └─────────────────────────────┘││
-│  └─────────────────────────────────┘│
-└─────────────────────────────────────┘
-                    │
-                    │ Direct WebSocket Client
-                    ▼
-┌─────────────────────────────────────┐
-│    External Server Package          │
-│  ┌─────────────────────────────────┐│
-│  │  WebSocket Server (port 8080)   ││
-│  │  UI Server (port 3001)          ││
-│  └─────────────────────────────────┘│
-└─────────────────────────────────────┘
+http-proxy-inspector [options] [-- <command...>]
+http-proxy-inspector init
+
+  -c, --config <file>     Config file
+  -p, --proxy <spec>      Add a proxy: <port>=<target> or <name>:<port>=<target> (repeatable)
+      --ui-port <port>    Port for the web UI (default: 4000)
+      --no-ui             Do not start the web UI
+      --host <host>       Interface to bind (default: localhost)
+  -q, --quiet             Do not log each request in the terminal
+  -h, --help              Show help
+  -v, --version           Show the version
 ```
 
-**Key Points:**
-- This package **creates its own WebSocket client** connections
-- No external package dependencies required
-- Direct connection to external WebSocket servers
-- Ultra-clean separation of concerns
-- Single initialization prevents duplicate setup
-
-## 🔧 Development
-
-### Build
+`--proxy` works without a config file and replaces a configured proxy on the same port:
 
 ```bash
-npm run build
+npx http-proxy-inspector -p users:3001=https://api.users.com -p payments:3002=https://api.payments.com
 ```
 
-### Development Mode
+## The UI
+
+- Live list of requests (newest first) with proxy, method, status, duration and time.
+- Filters by proxy, method or errors, plus a URL search.
+- Timeline of the most recent requests.
+- Details per request: upstream URL, timings, query parameters, request and response headers, and bodies as a collapsible JSON tree, form table or raw text.
+- **Copy as cURL** to replay a request against the real API.
+- Light and dark themes (follows your system setting until you pick one).
+
+Captured data lives in the inspector's memory: reloading the page keeps it, restarting the inspector clears it.
+
+## Programmatic use
+
+```js
+const { startInspector } = require('http-proxy-inspector');
+
+const inspector = await startInspector({
+  proxies: [{ name: 'users', port: 3001, target: 'https://api.users.com' }],
+});
+
+inspector.store.on('update', entry => {
+  if (entry.state !== 'pending') console.log(entry.method, entry.url, entry.response?.status);
+});
+
+await inspector.close();
+```
+
+## Limitations
+
+- WebSocket upgrades are not proxied.
+- Next.js only calls the proxy when a `fetch` actually goes to the network. Responses served from the Next.js Data Cache never reach it.
+- Bodies larger than `maxBodySize` are captured partially; compressed bodies that get truncated cannot be decoded.
+
+## Migrating from next-http-inspector
+
+This project used to be published as `next-http-inspector` (a Next.js fetch interceptor) plus `next-http-inspector-server` (the UI). Both are replaced by this package:
+
+1. Swap the packages:
+
+   ```bash
+   npm uninstall next-http-inspector next-http-inspector-server
+   npm install --save-dev http-proxy-inspector
+   ```
+
+2. Remove `initFetchServerInterceptor()` from your layout.
+3. Create a config with `npx http-proxy-inspector init` and point your API base URLs at the proxies.
+
+## Development
 
 ```bash
-npm run dev
+npm install
+npm test        # builds and runs the test suite
+npm run dev     # TypeScript watch mode
 ```
 
-## 📦 Package Structure
+### Project structure
 
 ```
 src/
-├── index.ts                    # Main initFetchServerInterceptor function
-├── types.ts                    # TypeScript definitions
-└── interceptors/
-    └── fetchInterceptor.ts      # HTTP request/response interceptor
+  cli.ts        CLI: flags, init, startup banner, per-request log, "-- <command>" mode
+  config.ts     Loads and validates the config file and merges --proxy flags
+  inspector.ts  startInspector(): starts every proxy and the UI
+  proxy.ts      Forwards requests with streaming; handles CORS, redirects, cookies and 502s
+  body.ts       Captures bodies up to maxBodySize and decodes compressed ones
+  store.ts      In-memory ring buffer of captured requests, with change events
+  uiServer.ts   Serves the UI, its JSON API and live updates (Server-Sent Events)
+  types.ts      Public config and request types
+ui/             Web UI in plain JavaScript (no build step, no CDN)
+test/           node:test suites for the proxy, the UI API and the config
 ```
 
-## 🔗 Related Packages
+The UI is a static page that talks to the inspector through these endpoints:
 
-- [`next-http-inspector-server`](../next-http-inspector-server) - External WebSocket and UI servers
+| Endpoint | Description |
+| --- | --- |
+| `GET /api/info` | Version and running proxies. |
+| `GET /api/requests` | Summaries of every captured request. |
+| `GET /api/requests/:id` | One request with headers and bodies. |
+| `DELETE /api/requests` | Clears the history. |
+| `GET /api/events` | Live updates as Server-Sent Events. |
 
-## 🛠️ Troubleshooting
+## Contributing
 
-### No Data Appearing in UI
+Issues and pull requests are welcome at [github.com/JhonSteven/http-proxy-inspector](https://github.com/JhonSteven/http-proxy-inspector). Please run `npm test` before opening a pull request; CI runs the same suite on Node.js 22, 24 and 26.
 
-1. **Check external servers are running**:
-   ```bash
-   next-inspector-server --ui-port 3001 --ws-port 8080
-   ```
+## License
 
-2. **Verify ports match**:
-   - WebSocket port in `initFetchServerInterceptor()` should match `--ws-port`
-   - UI port should match `--ui-port`
-
-3. **Check logs**:
-   - Look for "🚀 Initializing Fetch Server Interceptor..." in console
-   - Verify interceptor is enabled: "✅ Fetch Server Interceptor initialized successfully!"
-
-### Initialization Issues
-
-The package automatically prevents multiple initializations. If you need to reinitialize:
-
-1. **Restart your Next.js app**:
-   ```bash
-   # Stop app (Ctrl+C)
-   npm run dev
-   ```
-
-2. **Ensure initialization happens only on server side**:
-   ```typescript
-   if (typeof window === 'undefined') {
-    initFetchServerInterceptor({ ... });
-  }
-   ```
-
-### Connection Issues
-
-If WebSocket connection fails:
-
-1. **Check server is running**:
-   ```bash
-   curl http://localhost:3001/ui
-   ```
-
-2. **Verify port availability**:
-   ```bash
-   lsof -i :8080
-   ```
-
-3. **Check connection logs**:
-   - Look for WebSocket connection messages in console
-   - HTTP fallback will be used automatically if WebSocket fails
-
-## 📄 License
-
-MIT
-
-## 🤝 Contributing
-
-Contributions are welcome! Please read our contributing guidelines and submit pull requests to our repository.
-
-## 📞 Support
-
-If you encounter any issues or have questions, please open an issue on our GitHub repository.
+[MIT](LICENSE)
