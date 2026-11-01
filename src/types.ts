@@ -6,13 +6,36 @@
  */
 export type CorsOption = boolean | string[];
 
+export interface MockConfig {
+  /** HTTP method to match, e.g. "GET". Default: any method. */
+  method?: string;
+  /** Path to match, relative to the proxy. Supports `:param` segments and `*` wildcards, e.g. /users/:id */
+  path: string;
+  /** Query parameters that must be present with exactly these values. */
+  query?: Record<string, string>;
+  /** Response status. Default: 200. */
+  status?: number;
+  headers?: Record<string, string>;
+  /** Response body. Strings are sent as-is; anything else is sent as JSON. */
+  body?: unknown;
+  /** Milliseconds to wait before responding, to simulate latency. */
+  delay?: number;
+  /** Set to false to keep the mock in the config without using it. Default: true. */
+  enabled?: boolean;
+}
+
 export interface ProxyConfig {
   /** Label shown in the UI. Defaults to the target host. */
   name?: string;
   /** Local port the proxy listens on, e.g. 3001. */
   port: number;
-  /** Real URL requests are forwarded to. May include a base path, e.g. https://api.example.com/v1 */
-  target: string;
+  /**
+   * Real URL requests are forwarded to. May include a base path, e.g. https://api.example.com/v1
+   * Optional when `mocks` are defined: requests no mock matches then get a 404.
+   */
+  target?: string;
+  /** Simulated responses, checked in order before forwarding. The first match wins. */
+  mocks?: MockConfig[];
   /** Rewrite the Host header to the target host. Default: true. */
   changeOrigin?: boolean;
   /** Verify the target's TLS certificate. Set to false for self-signed targets. Default: true. */
@@ -41,10 +64,23 @@ export interface InspectorConfig {
   maxBodySize?: number;
 }
 
+export interface ResolvedMock {
+  /** Human-readable rule, e.g. "GET /users/:id". */
+  label: string;
+  method?: string;
+  pattern: RegExp;
+  query?: Record<string, string>;
+  status: number;
+  headers: Record<string, string>;
+  body: Buffer;
+  delay: number;
+}
+
 export interface ResolvedProxyConfig {
   name: string;
   port: number;
-  target: URL;
+  target?: URL;
+  mocks: ResolvedMock[];
   changeOrigin: boolean;
   secure: boolean;
   cors: CorsOption;
@@ -88,6 +124,8 @@ export interface CapturedRequest {
   url: string;
   startedAt: string;
   state: RequestState;
+  /** Mock rule that produced the response, when it did not come from the target. */
+  mock?: string;
   request: { headers: Headers; body?: CapturedBody };
   response?: { status: number; statusText: string; headers: Headers; body?: CapturedBody };
   /** Milliseconds since the proxy received the request. */
@@ -105,6 +143,7 @@ export interface RequestSummary {
   url: string;
   startedAt: string;
   state: RequestState;
+  mock?: string;
   status?: number;
   ttfb?: number;
   duration?: number;

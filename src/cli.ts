@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { spawn, type ChildProcess } from 'node:child_process';
-import { writeFileSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { watch, writeFileSync } from 'node:fs';
+import { basename, dirname, resolve } from 'node:path';
 import { CONFIG_FILES, ConfigError, findConfigFile, loadConfigFile, parseProxyFlag } from './config';
 import { startInspector, type Inspector } from './inspector';
 import type { CapturedRequest, InspectorConfig, ProxyConfig } from './types';
@@ -49,7 +49,14 @@ Examples:
 
 const STARTER_CONFIG = {
   ui: { port: 4000 },
-  proxies: [{ name: 'api', port: 3001, target: 'https://jsonplaceholder.typicode.com' }],
+  proxies: [
+    {
+      name: 'api',
+      port: 3001,
+      target: 'https://jsonplaceholder.typicode.com',
+      mocks: [{ method: 'GET', path: '/health', status: 200, body: { status: 'ok' } }],
+    },
+  ],
 };
 
 export function parseArgs(argv: string[]): CliOptions {
@@ -119,8 +126,12 @@ export function parseArgs(argv: string[]): CliOptions {
   return options;
 }
 
+function configPath(options: CliOptions, cwd: string): string | undefined {
+  return options.config ? resolve(cwd, options.config) : findConfigFile(cwd);
+}
+
 export async function buildConfig(options: CliOptions, cwd: string = process.cwd()): Promise<InspectorConfig> {
-  const file = options.config ? resolve(cwd, options.config) : findConfigFile(cwd);
+  const file = configPath(options, cwd);
   if (!file && options.proxies.length === 0) {
     throw new ConfigError(
       'No config found. Run "http-proxy-inspector init" to create one, or pass --proxy 3001=https://api.example.com',
@@ -157,7 +168,8 @@ function runInit(cwd: string = process.cwd()): void {
 Next steps:
   1. Set each proxy's "target" to the real API and pick a free "port".
   2. Point your app at the proxy, e.g. API_URL=http://localhost:3001 in .env.development
-  3. Run: npx http-proxy-inspector`);
+  3. Optional: add "mocks" to simulate responses (edits apply as soon as you save).
+  4. Run: npx http-proxy-inspector`);
 }
 
 const useColor = process.stdout.isTTY && !process.env.NO_COLOR;
@@ -168,7 +180,9 @@ function printBanner(inspector: Inspector): void {
   console.log(`\n🔭 ${paint(1, 'http-proxy-inspector')} v${VERSION}\n`);
   console.log('  Proxies');
   for (const proxy of inspector.proxies) {
-    console.log(`    ${proxy.name.padEnd(width)}  ${paint(36, proxy.url)}  →  ${proxy.target}`);
+    const target = proxy.target ?? paint(35, 'mocks only');
+    const mocks = proxy.mocks.length > 0 ? paint(35, `  (${proxy.mocks.length} mock${proxy.mocks.length === 1 ? '' : 's'})`) : '';
+    console.log(`    ${proxy.name.padEnd(width)}  ${paint(36, proxy.url)}  →  ${target}${mocks}`);
   }
   if (inspector.uiUrl) console.log(`\n  UI  ${paint(36, inspector.uiUrl)}`);
   console.log(`\n  ${paint(2, 'Point your app at the proxy URLs. Press Ctrl+C to stop.')}\n`);
@@ -183,10 +197,35 @@ function logRequest(entry: CapturedRequest, nameWidth: number): void {
       ? paint(status >= 500 ? 31 : status >= 400 ? 33 : status >= 300 ? 36 : 32, String(status))
       : paint(31, entry.state === 'aborted' ? 'ABRT' : 'ERR ');
   const duration = entry.timings.total !== undefined ? `${Math.round(entry.timings.total)} ms` : '';
+  const mock = entry.mock ? `  ${paint(35, 'mock')}` : '';
   const suffix = entry.error ? `  ${paint(31, entry.error)}` : '';
   console.log(
-    `  ${paint(2, time)}  ${entry.proxy.padEnd(nameWidth)}  ${entry.method.padEnd(6)} ${statusText}  ${entry.path}  ${paint(2, duration)}${suffix}`,
+    `  ${paint(2, time)}  ${entry.proxy.padEnd(nameWidth)}  ${entry.method.padEnd(6)} ${statusText}  ${entry.path}  ${paint(2, duration)}${mock}${suffix}`,
   );
+}
+
+/** Re-applies the config file whenever it is saved, so mocks can be edited without a restart. */
+function watchConfig(file: string, options: CliOptions, inspector: Inspector): void {
+  let timer: NodeJS.Timeout | undefined;
+  const reload = async () => {
+    try {
+      const result = inspector.reload(await buildConfig(options));
+      const mocks = inspector.proxies.reduce((total, proxy) => total + proxy.mocks.length, 0);
+      console.log(`  ${paint(35, '↻')} Config reloaded: ${mocks} active mock${mocks === 1 ? '' : 's'}.`);
+      if (result.needsRestart.length > 0) {
+        console.log(`  ${paint(33, '!')} Restart to apply: ${result.needsRestart.join(', ')}.`);
+      }
+    } catch (error) {
+      console.error(`  ${paint(31, '✖')} Config not reloaded: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  };
+
+  // Watch the folder: editors often save by replacing the file, which ends a watch on the file itself.
+  watch(dirname(file), (_event, name) => {
+    if (name !== basename(file)) return;
+    clearTimeout(timer);
+    timer = setTimeout(reload, 150);
+  }).unref();
 }
 
 export async function main(argv: string[] = process.argv.slice(2)): Promise<void> {
@@ -197,6 +236,9 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
 
   const inspector = await startInspector(await buildConfig(options));
   printBanner(inspector);
+
+  const file = configPath(options, process.cwd());
+  if (file) watchConfig(file, options, inspector);
 
   if (!options.quiet) {
     const nameWidth = Math.max(...inspector.proxies.map(proxy => proxy.name.length));

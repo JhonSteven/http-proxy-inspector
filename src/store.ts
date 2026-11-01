@@ -19,6 +19,7 @@ export function summarize(entry: CapturedRequest): RequestSummary {
     requestSize: entry.request.body?.size,
     responseSize: entry.response?.body?.size,
     contentType,
+    mock: entry.mock,
     error: entry.error,
   };
 }
@@ -30,7 +31,8 @@ function headerValue(value: string | string[] | undefined): string | undefined {
 /**
  * In-memory ring buffer of captured requests.
  *
- * Events: `update` (entry added or changed), `remove` (ids evicted), `clear`.
+ * Events: `update` (entry added or changed), `remove` (ids evicted), `clear`,
+ * and `config` (the inspector reloaded its config).
  */
 export class RequestStore extends EventEmitter {
   private readonly entries = new Map<string, CapturedRequest>();

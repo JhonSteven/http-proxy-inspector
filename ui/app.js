@@ -1,6 +1,6 @@
 'use strict';
 
-const METHOD_FILTERS = ['ALL', 'GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'ERROR'];
+const METHOD_FILTERS = ['ALL', 'GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'ERROR', 'MOCKED'];
 const THEME_KEY = 'http-proxy-inspector-theme';
 const TIMELINE_LIMIT = 150;
 const JSON_PAGE = 200;
@@ -95,7 +95,8 @@ function matches(summary) {
   const { method, proxy, search } = state.filter;
   if (proxy !== 'ALL' && summary.proxy !== proxy) return false;
   if (method === 'ERROR' && !isFailure(summary)) return false;
-  if (method !== 'ALL' && method !== 'ERROR' && summary.method !== method) return false;
+  if (method === 'MOCKED' && !summary.mock) return false;
+  if (!['ALL', 'ERROR', 'MOCKED'].includes(method) && summary.method !== method) return false;
   if (search && !summary.url.toLowerCase().includes(search) && !summary.path.toLowerCase().includes(search)) return false;
   return true;
 }
@@ -152,9 +153,12 @@ function buildProxyChips() {
 
   $('proxies').replaceChildren(
     chip('ALL', 'All proxies', null, 'Show requests from every proxy'),
-    ...proxies.map(proxy =>
-      chip(proxy.name, proxy.name, `:${proxy.port} → ${proxy.target.replace(/^https?:\/\//, '')}`, `${proxy.url} → ${proxy.target}`),
-    ),
+    ...proxies.map(proxy => {
+      const target = proxy.target ? proxy.target.replace(/^https?:\/\//, '') : 'mocks only';
+      const mocks = proxy.mocks.length ? ` · ${proxy.mocks.length} mock${proxy.mocks.length === 1 ? '' : 's'}` : '';
+      const title = [`${proxy.url} → ${proxy.target || 'mocks only'}`, ...proxy.mocks.map(mock => `mock: ${mock}`)].join('\n');
+      return chip(proxy.name, proxy.name, `:${proxy.port} → ${target}${mocks}`, title);
+    }),
   );
 }
 
@@ -176,6 +180,7 @@ function renderLine(summary) {
       { class: 'network-url', title: summary.url },
       h('span', { class: `expand-icon${state.expanded.has(summary.id) ? ' expanded' : ''}`, text: '▶' }),
       h('span', { class: 'path', text: summary.path }),
+      summary.mock && h('span', { class: 'mock-badge', text: 'MOCK', title: `Mock: ${summary.mock}` }),
     ),
     h('div', { class: 'network-proxy', text: summary.proxy, title: `localhost:${summary.proxyPort}` }),
     h('div', { class: `network-method method-${summary.method}${isFailure(summary) ? ' error' : ''}`, text: summary.method }),
@@ -339,7 +344,8 @@ function renderHeadersTab(entry) {
     'div',
     null,
     section('General', [
-      ['Upstream URL', entry.url],
+      entry.mock ? ['Served by', `Mock (${entry.mock}), not forwarded`] : ['Served by', 'Real API'],
+      [entry.mock ? 'URL' : 'Upstream URL', entry.url],
       ['Proxy', `${entry.proxy} (localhost:${entry.proxyPort})`],
       ['Method', entry.method],
       ['Status', response ? `${response.status} ${response.statusText}`.trim() : '—'],
@@ -703,6 +709,17 @@ async function fetchJson(url) {
   return response.json();
 }
 
+/** Reloads proxy info, e.g. after the config file changed. */
+async function refreshInfo() {
+  try {
+    state.info = await fetchJson('/api/info');
+    buildProxyChips();
+    scheduleRefresh();
+  } catch (error) {
+    console.error('Could not load proxy info', error);
+  }
+}
+
 /** Loads the current snapshot. Runs on every (re)connect so the page recovers from restarts. */
 async function resync() {
   try {
@@ -736,6 +753,7 @@ function connect() {
   source.addEventListener('request', event => upsert(JSON.parse(event.data)));
   source.addEventListener('remove', event => remove(JSON.parse(event.data)));
   source.addEventListener('clear', () => clearLocal());
+  source.addEventListener('config', () => refreshInfo());
 }
 
 function init() {

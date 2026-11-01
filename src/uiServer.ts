@@ -32,8 +32,11 @@ const HEARTBEAT_MS = 15_000;
 export interface UiProxyInfo {
   name: string;
   port: number;
-  target: string;
+  /** Undefined for proxies that only serve mocks. */
+  target?: string;
   url: string;
+  /** Active mock rules, e.g. "GET /users/:id". */
+  mocks: string[];
 }
 
 export interface UiOptions {
@@ -136,16 +139,19 @@ export function createUiHandler(store: RequestStore, options: UiOptions): Reques
       const onUpdate = (entry: CapturedRequest) => send('request', summarize(entry));
       const onRemove = (ids: string[]) => send('remove', ids);
       const onClear = () => send('clear', {});
+      const onConfig = () => send('config', {});
       const heartbeat = setInterval(() => res.write(': ping\n\n'), HEARTBEAT_MS);
 
       store.on('update', onUpdate);
       store.on('remove', onRemove);
       store.on('clear', onClear);
+      store.on('config', onConfig);
       req.on('close', () => {
         clearInterval(heartbeat);
         store.off('update', onUpdate);
         store.off('remove', onRemove);
         store.off('clear', onClear);
+        store.off('config', onConfig);
       });
       return;
     }

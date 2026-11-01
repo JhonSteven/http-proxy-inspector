@@ -14,8 +14,11 @@
               http://localhost:4000   (web UI: live list, timeline, headers, bodies)
 ```
 
+![HTTP Proxy Inspector UI](https://raw.githubusercontent.com/JhonSteven/http-proxy-inspector/main/docs/screenshot.png)
+
 - 🔀 **Many proxies, one process**: one local port per API, all shown in the same UI.
 - 🔍 **Full capture**: method, URL, headers, query, request and response bodies (gzip/brotli/deflate decoded, plus zstd on Node 22.15+), status and timings.
+- 🎭 **Mock responses**: simulate any endpoint with a status, headers, body and delay; edits apply as soon as you save.
 - 🌊 **Streaming-safe**: responses are piped as they arrive, so SSE and large downloads are not buffered.
 - 🧭 **Transparent**: rewrites `Host`, redirects and cookie domains so clients stay on the proxy; answers CORS preflights for localhost origins.
 - 🔒 **Local only**: binds to localhost and rejects foreign `Host` headers. No runtime dependencies.
@@ -94,7 +97,8 @@ export default defineConfig({
 | Option | Default | Description |
 | --- | --- | --- |
 | `proxies[].port` | required | Local port for this proxy. |
-| `proxies[].target` | required | Real URL to forward to. May include a base path; no query string. |
+| `proxies[].target` | required unless `mocks` | Real URL to forward to. May include a base path; no query string. |
+| `proxies[].mocks` | `[]` | Simulated responses, see [Mock responses](#mock-responses). |
 | `proxies[].name` | target host | Label shown in the UI and terminal. |
 | `proxies[].changeOrigin` | `true` | Send the target's host in the `Host` header and strip `Domain` from `Set-Cookie`. |
 | `proxies[].secure` | `true` | Verify TLS certificates. Set `false` for self-signed targets. |
@@ -105,6 +109,52 @@ export default defineConfig({
 | `host` | `localhost` | Interface to bind. `localhost` listens on both 127.0.0.1 and ::1. |
 | `maxEntries` | `500` | Requests kept in memory; older ones are dropped. |
 | `maxBodySize` | `1048576` | Bytes captured per body. Bodies are always forwarded whole. |
+
+## Mock responses
+
+Add `mocks` to a proxy to answer some endpoints with a simulated response instead of calling the real API. Requests that no mock matches are still forwarded to the `target`.
+
+```json
+{
+  "proxies": [
+    {
+      "name": "users",
+      "port": 3001,
+      "target": "https://api.users.com",
+      "mocks": [
+        { "method": "GET", "path": "/users/:id", "body": { "id": 1, "name": "Ada Lovelace" } },
+        { "method": "POST", "path": "/users", "status": 422, "body": { "error": "Email already taken" }, "delay": 800 },
+        { "path": "/reports/*", "status": 503, "headers": { "Retry-After": "30" } },
+        { "method": "GET", "path": "/search", "query": { "q": "empty" }, "body": [] },
+        { "method": "DELETE", "path": "/users/:id", "status": 204, "enabled": false }
+      ]
+    },
+    {
+      "name": "payments",
+      "port": 3002,
+      "mocks": [{ "method": "POST", "path": "/charges", "status": 201, "body": { "id": "ch_123", "status": "succeeded" } }]
+    }
+  ]
+}
+```
+
+| Field | Default | Description |
+| --- | --- | --- |
+| `path` | required | Path relative to the proxy. `:name` matches one segment, `*` matches anything. |
+| `method` | any | HTTP method to match. |
+| `query` | none | Query parameters that must be present with exactly these values. |
+| `status` | `200` | Response status (200–599). |
+| `headers` | none | Response headers. |
+| `body` | empty | Strings are sent as-is (`text/plain`); objects, arrays, numbers and booleans as JSON. |
+| `delay` | `0` | Milliseconds to wait before answering, to simulate a slow API. |
+| `enabled` | `true` | Set `false` to keep a mock in the file without using it. |
+
+- Mocks are checked in order and the first match wins.
+- A proxy without `target` only serves mocks and answers 404 to anything else, which is handy while the real API does not exist yet.
+- The CLI watches the config file: change a status, body or delay, save, and the next request uses it. Adding or removing proxies still needs a restart.
+- Mocked requests show a **MOCK** tag in the UI and in the terminal, and the **MOCKED** filter lists only them.
+
+![A mocked request in the UI](https://raw.githubusercontent.com/JhonSteven/http-proxy-inspector/main/docs/mocks.png)
 
 ## CLI
 
@@ -131,7 +181,7 @@ npx http-proxy-inspector -p users:3001=https://api.users.com -p payments:3002=ht
 ## The UI
 
 - Live list of requests (newest first) with proxy, method, status, duration and time.
-- Filters by proxy, method or errors, plus a URL search.
+- Filters by proxy, method, errors or mocked requests, plus a URL search.
 - Timeline of the most recent requests.
 - Details per request: upstream URL, timings, query parameters, request and response headers, and bodies as a collapsible JSON tree, form table or raw text.
 - **Copy as cURL** to replay a request against the real API.
@@ -190,13 +240,13 @@ src/
   cli.ts        CLI: flags, init, startup banner, per-request log, "-- <command>" mode
   config.ts     Loads and validates the config file and merges --proxy flags
   inspector.ts  startInspector(): starts every proxy and the UI
-  proxy.ts      Forwards requests with streaming; handles CORS, redirects, cookies and 502s
+  proxy.ts      Serves mocks or forwards requests with streaming; handles CORS, redirects, cookies and 502s
   body.ts       Captures bodies up to maxBodySize and decodes compressed ones
   store.ts      In-memory ring buffer of captured requests, with change events
   uiServer.ts   Serves the UI, its JSON API and live updates (Server-Sent Events)
   types.ts      Public config and request types
 ui/             Web UI in plain JavaScript (no build step, no CDN)
-test/           node:test suites for the proxy, the UI API and the config
+test/           node:test suites for the proxy, mocks, the UI API and the config
 ```
 
 The UI is a static page that talks to the inspector through these endpoints:

@@ -1,7 +1,7 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { resolve, extname } from 'node:path';
 import { pathToFileURL } from 'node:url';
-import type { InspectorConfig, ProxyConfig, ResolvedConfig, ResolvedProxyConfig } from './types';
+import type { InspectorConfig, MockConfig, ProxyConfig, ResolvedConfig, ResolvedMock, ResolvedProxyConfig } from './types';
 
 export const CONFIG_FILES = [
   'http-proxy-inspector.config.json',
@@ -47,7 +47,9 @@ export async function loadConfigFile(file: string): Promise<Partial<InspectorCon
     }
   }
 
-  const mod = await import(pathToFileURL(fullPath).href);
+  // Bypass the module caches so edits are picked up when the file is reloaded.
+  delete require.cache[fullPath];
+  const mod = await import(`${pathToFileURL(fullPath).href}?t=${Date.now()}`);
   const config = mod.default ?? mod;
   return typeof config === 'function' ? await config() : config;
 }
@@ -72,6 +74,82 @@ function isPort(value: unknown): value is number {
   return Number.isInteger(value) && (value as number) >= 0 && (value as number) <= 65535;
 }
 
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+/** Turns `/users/:id/*` into a regular expression. A trailing slash is optional. */
+function compilePath(path: string): RegExp {
+  const source = path
+    .replace(/\/+$/, '')
+    .replace(/[.+?^${}()|[\]\\]/g, '\\$&')
+    .replace(/\*/g, '.*')
+    .replace(/:\w+/g, '[^/]+');
+  return new RegExp(`^${source}/?$`);
+}
+
+function resolveMock(mock: MockConfig, label: string): ResolvedMock | undefined {
+  if (!isPlainObject(mock)) throw new ConfigError(`${label} must be an object with at least a "path".`);
+  if (typeof mock.path !== 'string' || !mock.path.startsWith('/')) {
+    throw new ConfigError(`${label}.path must start with "/" (got ${JSON.stringify(mock.path)}).`);
+  }
+  if (mock.method !== undefined && (typeof mock.method !== 'string' || !mock.method.trim())) {
+    throw new ConfigError(`${label}.method must be an HTTP method such as "GET".`);
+  }
+  const status = mock.status ?? 200;
+  if (!Number.isInteger(status) || status < 200 || status > 599) {
+    throw new ConfigError(`${label}.status must be an integer between 200 and 599 (got ${JSON.stringify(mock.status)}).`);
+  }
+  const delay = mock.delay ?? 0;
+  if (!Number.isFinite(delay) || delay < 0) {
+    throw new ConfigError(`${label}.delay must be a non-negative number of milliseconds.`);
+  }
+  for (const [field, value] of [['headers', mock.headers], ['query', mock.query]] as const) {
+    if (value !== undefined && !isPlainObject(value)) throw new ConfigError(`${label}.${field} must be an object.`);
+  }
+  if (mock.enabled === false) return undefined;
+
+  const headers: Record<string, string> = {};
+  for (const [name, value] of Object.entries(mock.headers ?? {})) headers[name.toLowerCase()] = String(value);
+
+  let body: Buffer;
+  let contentType: string;
+  if (mock.body === undefined || mock.body === null) {
+    body = Buffer.alloc(0);
+    contentType = 'text/plain; charset=utf-8';
+  } else if (typeof mock.body === 'string') {
+    body = Buffer.from(mock.body);
+    contentType = 'text/plain; charset=utf-8';
+  } else if (Buffer.isBuffer(mock.body)) {
+    body = mock.body;
+    contentType = 'application/octet-stream';
+  } else {
+    try {
+      body = Buffer.from(JSON.stringify(mock.body, null, 2));
+    } catch (error) {
+      throw new ConfigError(`${label}.body cannot be converted to JSON: ${(error as Error).message}`);
+    }
+    contentType = 'application/json; charset=utf-8';
+  }
+  if (body.length > 0 && !headers['content-type']) headers['content-type'] = contentType;
+
+  const method = mock.method?.trim().toUpperCase();
+  const anyMethod = method === undefined || method === '*' || method === 'ANY';
+  const query: Record<string, string> = {};
+  for (const [name, value] of Object.entries(mock.query ?? {})) query[name] = String(value);
+
+  return {
+    label: `${anyMethod ? 'ANY' : method} ${mock.path}`,
+    method: anyMethod ? undefined : method,
+    pattern: compilePath(mock.path),
+    query: Object.keys(query).length > 0 ? query : undefined,
+    status,
+    headers,
+    body,
+    delay,
+  };
+}
+
 function resolveProxy(proxy: ProxyConfig, index: number): ResolvedProxyConfig {
   const label = `proxies[${index}]`;
   if (!proxy || typeof proxy !== 'object') {
@@ -80,18 +158,30 @@ function resolveProxy(proxy: ProxyConfig, index: number): ResolvedProxyConfig {
   if (!isPort(proxy.port)) {
     throw new ConfigError(`${label}.port must be an integer between 0 and 65535 (got ${JSON.stringify(proxy.port)}).`);
   }
+  if (proxy.mocks !== undefined && !Array.isArray(proxy.mocks)) {
+    throw new ConfigError(`${label}.mocks must be a list.`);
+  }
+  if (proxy.target === undefined && !proxy.mocks?.length) {
+    throw new ConfigError(`${label} needs a "target" URL, "mocks", or both.`);
+  }
 
-  let target: URL;
-  try {
-    target = new URL(proxy.target);
-  } catch {
-    throw new ConfigError(`${label}.target must be an absolute URL (got ${JSON.stringify(proxy.target)}).`);
-  }
-  if (target.protocol !== 'http:' && target.protocol !== 'https:') {
-    throw new ConfigError(`${label}.target must use http or https (got ${target.protocol}).`);
-  }
-  if (target.search || target.hash) {
-    throw new ConfigError(`${label}.target must not include a query string or hash.`);
+  const mocks = (proxy.mocks ?? [])
+    .map((mock, mockIndex) => resolveMock(mock, `${label}.mocks[${mockIndex}]`))
+    .filter((mock): mock is ResolvedMock => mock !== undefined);
+
+  let target: URL | undefined;
+  if (proxy.target !== undefined) {
+    try {
+      target = new URL(proxy.target);
+    } catch {
+      throw new ConfigError(`${label}.target must be an absolute URL (got ${JSON.stringify(proxy.target)}).`);
+    }
+    if (target.protocol !== 'http:' && target.protocol !== 'https:') {
+      throw new ConfigError(`${label}.target must use http or https (got ${target.protocol}).`);
+    }
+    if (target.search || target.hash) {
+      throw new ConfigError(`${label}.target must not include a query string or hash.`);
+    }
   }
 
   const cors = proxy.cors ?? true;
@@ -103,9 +193,10 @@ function resolveProxy(proxy: ProxyConfig, index: number): ResolvedProxyConfig {
   }
 
   return {
-    name: proxy.name?.trim() || target.host,
+    name: proxy.name?.trim() || target?.host || `mocks:${proxy.port}`,
     port: proxy.port,
     target,
+    mocks,
     changeOrigin: proxy.changeOrigin ?? true,
     secure: proxy.secure ?? true,
     cors,

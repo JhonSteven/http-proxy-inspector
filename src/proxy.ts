@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import {
   Agent as HttpAgent,
+  STATUS_CODES,
   request as httpRequest,
   type IncomingHttpHeaders,
   type OutgoingHttpHeaders,
@@ -11,7 +12,7 @@ import { isIP } from 'node:net';
 import { performance } from 'node:perf_hooks';
 import { BodyCollector } from './body';
 import type { RequestStore } from './store';
-import type { CorsOption, Headers, RequestState, ResolvedProxyConfig } from './types';
+import type { CorsOption, Headers, RequestState, ResolvedMock, ResolvedProxyConfig } from './types';
 
 const HOP_BY_HOP = new Set([
   'connection',
@@ -135,12 +136,45 @@ function describeError(error: NodeJS.ErrnoException, url: URL): string {
   return error.code ? `${error.code}: ${error.message}` : error.message;
 }
 
+/** Returns the first mock that matches the request, if any. */
+export function findMock(mocks: ResolvedMock[], method: string, requestUrl: string): ResolvedMock | undefined {
+  let url: URL;
+  try {
+    url = new URL(requestUrl.startsWith('/') ? `http://localhost${requestUrl}` : requestUrl);
+  } catch {
+    return undefined;
+  }
+  return mocks.find(
+    mock =>
+      (!mock.method || mock.method === method) &&
+      mock.pattern.test(url.pathname) &&
+      Object.entries(mock.query ?? {}).every(([name, value]) => url.searchParams.get(name) === value),
+  );
+}
+
+function toHeaders(headers: OutgoingHttpHeaders): Headers {
+  const result: Headers = {};
+  for (const [name, value] of Object.entries(headers)) {
+    if (value !== undefined) result[name] = Array.isArray(value) ? value : String(value);
+  }
+  return result;
+}
+
 export function createProxyHandler(proxy: ResolvedProxyConfig, store: RequestStore, maxBodySize: number): RequestListener {
-  const isHttps = proxy.target.protocol === 'https:';
-  const send = isHttps ? httpsRequest : httpRequest;
-  const agent = isHttps
-    ? new HttpsAgent({ keepAlive: true, rejectUnauthorized: proxy.secure })
-    : new HttpAgent({ keepAlive: true });
+  // Settings are read from `proxy` on every request, so a config reload applies right away.
+  const agents = new Map<string, HttpAgent>();
+  const agentFor = (target: URL): HttpAgent => {
+    const key = `${target.protocol}|${proxy.secure}`;
+    let agent = agents.get(key);
+    if (!agent) {
+      agent =
+        target.protocol === 'https:'
+          ? new HttpsAgent({ keepAlive: true, rejectUnauthorized: proxy.secure })
+          : new HttpAgent({ keepAlive: true });
+      agents.set(key, agent);
+    }
+    return agent;
+  };
 
   return (req, res) => {
     const start = performance.now();
@@ -160,9 +194,14 @@ export function createProxyHandler(proxy: ResolvedProxyConfig, store: RequestSto
       return;
     }
 
-    let upstreamUrl: URL;
+    const target = proxy.target;
+    const mock = findMock(proxy.mocks, method, req.url ?? '/');
+
+    let url: URL;
     try {
-      upstreamUrl = buildUpstreamUrl(proxy.target, req.url ?? '/');
+      url = target
+        ? buildUpstreamUrl(target, req.url ?? '/')
+        : new URL(`http://${req.headers.host ?? `localhost:${proxy.port}`}${req.url ?? '/'}`);
     } catch {
       res.writeHead(400, { 'content-type': 'text/plain; charset=utf-8' });
       res.end('Invalid request URL');
@@ -175,9 +214,10 @@ export function createProxyHandler(proxy: ResolvedProxyConfig, store: RequestSto
       proxyPort: req.socket.localPort ?? proxy.port,
       method,
       path: req.url ?? '/',
-      url: upstreamUrl.href,
+      url: url.href,
       startedAt: new Date().toISOString(),
       state: 'pending',
+      mock: mock ? mock.label : target ? undefined : 'no match',
       request: { headers: cloneHeaders(req.headers) },
       timings: {},
     });
@@ -185,6 +225,7 @@ export function createProxyHandler(proxy: ResolvedProxyConfig, store: RequestSto
     const requestBody = new BodyCollector(maxBodySize);
     const responseBody = new BodyCollector(maxBodySize);
     let finished = false;
+    let cancel = () => {};
 
     const finish = (state: RequestState, error?: string) => {
       if (finished) return;
@@ -197,21 +238,70 @@ export function createProxyHandler(proxy: ResolvedProxyConfig, store: RequestSto
       store.update(entry);
     };
 
-    const headers = forwardableHeaders(req.headers);
-    if (proxy.changeOrigin) headers.host = upstreamUrl.host;
+    res.on('close', () => {
+      if (res.writableFinished) return;
+      finish('aborted', 'The client closed the connection before the response finished.');
+      cancel();
+    });
 
-    const hostname = upstreamUrl.hostname.replace(/^\[|\]$/g, '');
-    const upstream = send(upstreamUrl, {
+    // Errors on the client side are reported through the `close` handler above.
+    req.on('error', () => {});
+    res.on('error', () => {});
+    req.on('data', (chunk: Buffer) => requestBody.push(chunk));
+
+    if (mock || !target) {
+      const respond = () => {
+        if (finished || res.destroyed) return;
+        const status = mock ? mock.status : 404;
+        const body = mock
+          ? mock.body
+          : Buffer.from(
+              JSON.stringify({
+                error: 'Not Found',
+                message: `No mock matches ${method} ${url.pathname} and this proxy has no target.`,
+                proxy: proxy.name,
+              }),
+            );
+        const headers: OutgoingHttpHeaders = mock ? { ...mock.headers } : { 'content-type': 'application/json; charset=utf-8' };
+        const sendsBody = status !== 204 && status !== 304 && method !== 'HEAD';
+        if (status !== 204 && status !== 304) headers['content-length'] = String(body.length);
+        if (origin) applyCors(headers, origin, { ...headers } as IncomingHttpHeaders);
+
+        entry.timings.ttfb = elapsed();
+        entry.response = { status, statusText: STATUS_CODES[status] ?? '', headers: toHeaders(headers) };
+        if (sendsBody) responseBody.push(body);
+        res.writeHead(status, headers);
+        res.end(sendsBody ? body : undefined);
+        finish('complete');
+      };
+
+      // Read the whole request first so its body is captured, then answer after the configured delay.
+      req.on('end', () => {
+        if (!mock?.delay) return respond();
+        const timer = setTimeout(respond, mock.delay);
+        cancel = () => clearTimeout(timer);
+      });
+      return;
+    }
+
+    const headers = forwardableHeaders(req.headers);
+    if (proxy.changeOrigin) headers.host = url.host;
+
+    const isHttps = url.protocol === 'https:';
+    const hostname = url.hostname.replace(/^\[|\]$/g, '');
+    const upstream = (isHttps ? httpsRequest : httpRequest)(url, {
       method,
       headers,
-      agent,
+      agent: agentFor(target),
       // SNI must name the target even when the Host header is kept (changeOrigin: false).
       ...(isHttps && isIP(hostname) === 0 ? { servername: hostname } : {}),
     });
+    cancel = () => upstream.destroy();
 
-    if (proxy.timeout) {
-      upstream.setTimeout(proxy.timeout, () => {
-        upstream.destroy(new Error(`No response from ${upstreamUrl.host} within ${proxy.timeout} ms.`));
+    const timeout = proxy.timeout;
+    if (timeout) {
+      upstream.setTimeout(timeout, () => {
+        upstream.destroy(new Error(`No response from ${url.host} within ${timeout} ms.`));
       });
     }
 
@@ -228,7 +318,7 @@ export function createProxyHandler(proxy: ResolvedProxyConfig, store: RequestSto
       const responseHeaders = forwardableHeaders(upstreamRes.headers);
       const proxyOrigin = `http://${req.headers.host ?? `localhost:${entry.proxyPort}`}`;
       if (typeof responseHeaders.location === 'string') {
-        responseHeaders.location = rewriteLocation(responseHeaders.location, proxy.target, proxyOrigin);
+        responseHeaders.location = rewriteLocation(responseHeaders.location, target, proxyOrigin);
       }
       if (proxy.changeOrigin && Array.isArray(responseHeaders['set-cookie'])) {
         // Cookies scoped to the target domain would be rejected on localhost.
@@ -240,7 +330,7 @@ export function createProxyHandler(proxy: ResolvedProxyConfig, store: RequestSto
       upstreamRes.on('data', (chunk: Buffer) => responseBody.push(chunk));
       upstreamRes.on('end', () => finish('complete'));
       upstreamRes.on('error', error => {
-        finish('error', describeError(error, upstreamUrl));
+        finish('error', describeError(error, url));
         res.destroy();
       });
       upstreamRes.pipe(res);
@@ -248,7 +338,7 @@ export function createProxyHandler(proxy: ResolvedProxyConfig, store: RequestSto
 
     upstream.on('error', (error: NodeJS.ErrnoException) => {
       if (finished) return;
-      const message = describeError(error, upstreamUrl);
+      const message = describeError(error, url);
       finish('error', message);
       req.unpipe(upstream);
       req.resume();
@@ -257,21 +347,10 @@ export function createProxyHandler(proxy: ResolvedProxyConfig, store: RequestSto
         res.destroy();
       } else if (!res.destroyed) {
         res.writeHead(502, { 'content-type': 'application/json; charset=utf-8', ...(origin ? corsHeaders(origin) : {}) });
-        res.end(JSON.stringify({ error: 'Bad Gateway', message, proxy: proxy.name, target: upstreamUrl.href }));
+        res.end(JSON.stringify({ error: 'Bad Gateway', message, proxy: proxy.name, target: url.href }));
       }
     });
 
-    res.on('close', () => {
-      if (res.writableFinished) return;
-      finish('aborted', 'The client closed the connection before the response finished.');
-      upstream.destroy();
-    });
-
-    // Errors on the client side are reported through the `close` handler above.
-    req.on('error', () => {});
-    res.on('error', () => {});
-
-    req.on('data', (chunk: Buffer) => requestBody.push(chunk));
     req.pipe(upstream);
   };
 }
